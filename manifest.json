@@ -1,8 +1,8 @@
 {
   "name": "bilibili-vault-link",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "minAppVersion": "1.9.0",
-  "description": "Learning Vault 式库：B站视频粘贴链接归档 + 深度归档（本地 GPU 转写、逐帧图注），引擎=bilibili-video-learning 技能",
+  "description": "Learning Vault 式库：B站视频粘贴链接归档 + 深度归档（本地 GPU 转写、逐帧图注、AI 自动分类），引擎=bilibili-video-learning 技能",
   "author": "Confidence-huang",
   "isDesktopOnly": true
 }

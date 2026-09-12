@@ -27,6 +27,8 @@ const DEFAULT_SETTINGS = {
   visionUrl: "http://127.0.0.1:11434/v1",
   visionModel: "qwen2.5vl:3b",
   visionEnabled: true,
+  aiModel: "qwen2.5:3b",
+  aiCategories: "成长学习\n投资理财\nAI编程\n心理情感\n职场商业\n娱乐生活\n运动健康\n其他（不好分类）",
   autoDeepArchive: false,
 };
 
@@ -101,6 +103,12 @@ class BiliVaultLinkSettingTab extends PluginSettingTab {
     new Setting(containerEl).setName("启用视觉图注").setDesc("逐帧交给本地多模态模型（如 Ollama qwen2.5vl），生成「字幕原文｜概述」图注").addToggle((t) => t.setValue(s.visionEnabled).onChange(async (v) => { s.visionEnabled = v; await this.plugin.saveSettings(); }));
     new Setting(containerEl).setName("视觉端点").setDesc("OpenAI 兼容端点根；默认本机 Ollama").addText((t) => t.setValue(s.visionUrl).onChange(async (v) => { s.visionUrl = v.trim(); await this.plugin.saveSettings(); }));
     new Setting(containerEl).setName("视觉模型").addText((t) => t.setValue(s.visionModel).onChange(async (v) => { s.visionModel = v.trim() || "qwen2.5vl:3b"; await this.plugin.saveSettings(); }));
+    new Setting(containerEl).setName("AI 自动分类（本地）").setHeading();
+    new Setting(containerEl).setName("文本模型").setDesc("深度归档时自动给笔记写 category 分类").addText((t) => t.setValue(s.aiModel).onChange(async (v) => { s.aiModel = v.trim() || "qwen2.5:3b"; await this.plugin.saveSettings(); }));
+    new Setting(containerEl).setName("分类列表").setDesc("每行一个；引擎只从中选择").addTextArea((t) => {
+      t.setValue(s.aiCategories).onChange(async (v) => { s.aiCategories = v; await this.plugin.saveSettings(); });
+      t.inputEl.setAttr("rows", 6);
+    });
     new Setting(containerEl).setName("自动深度归档").setDesc("开启后：粘贴归档产生的新笔记自动跑深度归档引擎；每条约 +1~2 分钟。默认关").addToggle((t) => t.setValue(s.autoDeepArchive || false).onChange(async (v) => { s.autoDeepArchive = v; await this.plugin.saveSettings(); }));
   }
 }
@@ -222,6 +230,11 @@ class BiliVaultLinkPlugin extends Plugin {
     if (this.settings.cookiesFile) args.push("--cookies-file", this.settings.cookiesFile);
     if (this.settings.visionEnabled && this.settings.visionUrl) {
       args.push("--vision", "--vision-url", this.settings.visionUrl, "--vision-model", this.settings.visionModel || "qwen2.5vl:3b");
+    }
+    if ((this.settings.aiCategories || "").trim()) {
+      args.push("--ai-url", this.settings.visionUrl || "http://127.0.0.1:11434/v1",
+        "--ai-model", this.settings.aiModel || "qwen2.5:3b",
+        "--categories", this.settings.aiCategories);
     }
     return await new Promise((resolve, reject) => {
       const cp = window.require("child_process").spawn(py, args, { windowsHide: true });
