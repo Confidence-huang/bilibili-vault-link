@@ -2,12 +2,16 @@
  * bilibili-vault-link — Learning Vault 式 Obsidian 库 × bilibili-video-learning 技能 伴生桥接插件
  *
  * 职责：
- *   1. 粘贴链接归档：BV/av/b23 链接 → 引擎生成收件箱笔记（YAML 契约键 bvid）
- *   2. 深度归档：打开笔记执行 → 引擎产出逐帧 × 转写对照（本地 GPU 转写 + 视觉图注）
- *   3. 新笔记自动深度归档（开关，默认关）
+ *   1. 收藏夹同步：引擎 --metadata-only 逐条入库（YAML 契约键 bvid）+ AI 本地分类，目录镜像收藏夹
+ *   2. 粘贴链接归档：BV/av/b23 链接 → 引擎生成收件箱笔记
+ *   3. 深度归档：打开笔记执行 → 引擎产出逐帧 × 转写对照（本地 GPU 转写 + 视觉图注）
+ *   4. 新笔记自动深度归档（开关，默认关）
+ *   5. 晋升为来源笔记（收件箱 → 04-来源，带确认弹窗）并挂 03-主题地图
+ *   6. 同步日志：同步/归档/深度归档/晋升追加一行到 B站归档/同步日志.md
  *
- * 架构：薄客户端——全部管线在 bilibili-video-learning 技能的 bilibili_deep_archive.py（单一实现）。
- * 边界：只写收件箱目录；Cookie/Key 不入库。
+ * 架构：薄客户端——全部管线在 bilibili-video-learning 技能的 bilibili_deep_archive.py（单一实现）；
+ *       封面下载与 vault_status/promoted_to 契约字段由引擎负责（1.4.2+）。
+ * 边界：只写收件箱与 04-来源（晋升需确认弹窗）；Cookie/Key 不入库。
  */
 "use strict";
 
@@ -18,6 +22,11 @@ const path = require("path");
 const DEFAULT_SETTINGS = {
   inboxDir: "00-原始笔记/B站归档",
   mediaDir: "附件/bili-media",
+  sourceFolder: "04-来源",
+  mapsFolder: "03-主题地图",
+  syncLogEnabled: true,
+  syncLogPath: "00-原始笔记/B站归档/同步日志.md",
+  domainRegistry: "education\nhardware\nmath\nsoftware\nweb",
   enginePython: "",
   localAsrModel: "small",
   maxFrames: 24,
@@ -46,6 +55,72 @@ function extractBiliRefs(text) {
     else if (m[0]) { if (!seen.has(m[0])) { seen.add(m[0]); refs.push({ url: m[0] }); } }
   }
   return refs;
+}
+
+/* ---------------- 小工具（与 douyin-vault-link 同款） ---------------- */
+
+function sanitizeTitle(s, max = 80) {
+  const t = String(s || "").replace(/[\\/:*?"<>|#^[\]%\u0000-\u001f]/g, " ").replace(/\s+/g, " ").trim();
+  return t ? (t.length > max ? t.slice(0, max).trim() : t) : "";
+}
+
+function fmStr(v) { return v == null ? '""' : JSON.stringify(String(v)); }
+
+function todayLocal() {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+
+function nowStamp() {
+  const d = new Date();
+  return `${todayLocal()} ${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+}
+
+function mdLink(display, vaultPath) {
+  const enc = vaultPath.split("/").map(encodeURIComponent).join("/");
+  return `[${display}](${enc})`;
+}
+
+async function ensureFolder(vault, p) {
+  const parts = normalizePath(p).split("/").filter(Boolean);
+  let cur = "";
+  for (const part of parts) {
+    cur = cur ? `${cur}/${part}` : part;
+    if (!vault.getAbstractFileByPath(cur)) {
+      try { await vault.createFolder(cur); } catch {}
+    }
+  }
+}
+
+/* 解析笔记 frontmatter（扁平 key: value，够用于自己生成的 YAML） */
+function parseFrontmatter(text) {
+  if (!text.startsWith("---")) return { data: {}, body: text, fmEnd: 0 };
+  const end = text.indexOf("\n---", 3);
+  if (end < 0) return { data: {}, body: text, fmEnd: 0 };
+  const block = text.slice(4, end);
+  const data = {};
+  for (const line of block.split("\n")) {
+    const m = line.match(/^([A-Za-z0-9_]+):\s*(.*)$/);
+    if (!m) continue;
+    let v = m[2].trim();
+    if (/^".*"$/.test(v)) { try { v = JSON.parse(v); } catch {} }
+    data[m[1]] = v;
+  }
+  return { data, body: text.slice(end + 4), fmEnd: end + 4 };
+}
+
+function updateFrontmatter(text, updates) {
+  if (!text.startsWith("---")) return text;
+  const end = text.indexOf("\n---", 3);
+  if (end < 0) return text;
+  let block = text.slice(4, end);
+  for (const [k, v] of Object.entries(updates)) {
+    const re = new RegExp(`^${k}:.*$`, "m");
+    const line = `${k}: ${typeof v === "string" && v.startsWith("[[") ? fmStr(v) : v}`;
+    if (re.test(block)) block = block.replace(re, line);
+    else block = `${block}\n${line}`;
+  }
+  return `---\n${block}\n---${text.slice(end + 4)}`;
 }
 
 class LinkInputModal extends Modal {
@@ -87,8 +162,18 @@ class BiliVaultLinkSettingTab extends PluginSettingTab {
     const { containerEl } = this;
     containerEl.empty();
     const s = this.plugin.settings;
+    new Setting(containerEl).setName("路径").setHeading();
     new Setting(containerEl).setName("B站归档收件箱").setDesc("引擎产出笔记的目录（相对库根）").addText((t) => t.setValue(s.inboxDir).onChange(async (v) => { s.inboxDir = v.trim(); await this.plugin.saveSettings(); }));
-    new Setting(containerEl).setName("媒体目录").setDesc("帧图存放处（相对库根）").addText((t) => t.setValue(s.mediaDir).onChange(async (v) => { s.mediaDir = v.trim(); await this.plugin.saveSettings(); }));
+    new Setting(containerEl).setName("媒体目录").setDesc("帧图与封面存放处（相对库根）").addText((t) => t.setValue(s.mediaDir).onChange(async (v) => { s.mediaDir = v.trim(); await this.plugin.saveSettings(); }));
+    new Setting(containerEl).setName("来源目录").setDesc("晋升目标（04-来源）").addText((t) => t.setValue(s.sourceFolder).onChange(async (v) => { s.sourceFolder = v.trim() || DEFAULT_SETTINGS.sourceFolder; await this.plugin.saveSettings(); }));
+    new Setting(containerEl).setName("主题地图目录").addText((t) => t.setValue(s.mapsFolder).onChange(async (v) => { s.mapsFolder = v.trim() || DEFAULT_SETTINGS.mapsFolder; await this.plugin.saveSettings(); }));
+    new Setting(containerEl).setName("同步日志").setHeading();
+    new Setting(containerEl).setName("启用同步日志").setDesc("每次同步/归档/晋升追加一行到日志笔记（过程产物）").addToggle((t) => t.setValue(s.syncLogEnabled).onChange(async (v) => { s.syncLogEnabled = v; await this.plugin.saveSettings(); }));
+    new Setting(containerEl).setName("日志路径").addText((t) => t.setValue(s.syncLogPath).onChange(async (v) => { s.syncLogPath = v.trim() || DEFAULT_SETTINGS.syncLogPath; await this.plugin.saveSettings(); }));
+    new Setting(containerEl).setName("领域标签注册表").setDesc("每行一个 domain/<slug>（禁 domain/other）").addTextArea((t) => {
+      t.setValue(s.domainRegistry).onChange(async (v) => { s.domainRegistry = v; await this.plugin.saveSettings(); });
+      t.inputEl.rows = 5; t.inputEl.style.width = "100%";
+    });
     new Setting(containerEl).setName("深度归档（逐帧 × 转写）").setHeading();
     new Setting(containerEl).setName("最多关键帧数").addText((t) => t.setValue(String(s.maxFrames)).onChange(async (v) => { const n = parseInt(v, 10); s.maxFrames = Number.isFinite(n) && n >= 2 ? n : 24; await this.plugin.saveSettings(); }));
     new Setting(containerEl).setName("引擎 Python").setDesc("bilibili-video-learning 技能 .venv-gpu 里的 python.exe；留空 = %USERPROFILE%\\.agents\\skills\\bilibili-video-learning\\.venv-gpu\\Scripts\\python.exe").addText((t) => t.setValue(s.enginePython || "").onChange(async (v) => { s.enginePython = v.trim(); await this.plugin.saveSettings(); }));
@@ -121,6 +206,7 @@ class BiliVaultLinkPlugin extends Plugin {
     this.addSettingTab(new BiliVaultLinkSettingTab(this.app, this));
     this.addCommand({ id: "paste-link-archive", name: "粘贴链接归档（BV/av/b23，单条/多条）", callback: () => this.cmdPasteArchive() });
     this.addCommand({ id: "deep-archive", name: "深度归档（逐帧提取 × 转写对照）", callback: () => this.cmdDeepArchive() });
+    this.addCommand({ id: "promote-to-source", name: "晋升为来源笔记（收件箱 → 04-来源）", callback: () => this.cmdPromote() });
     this.addCommand({ id: "open-inbox", name: "打开B站归档收件箱", callback: () => this.cmdOpenInbox() });
     this.addCommand({ id: "sync-favorites", name: "同步B站收藏夹（元数据 + AI分类）", callback: () => this.cmdSyncFavorites() });
     this.addRibbonIcon("play-circle", "B站 × 笔记库桥接", (evt) => this.showMenu(evt));
@@ -133,6 +219,7 @@ class BiliVaultLinkPlugin extends Plugin {
     const menu = new Menu();
     menu.addItem((i) => i.setTitle("粘贴链接归档").setIcon("clipboard").onClick(() => this.cmdPasteArchive()));
     menu.addItem((i) => i.setTitle("深度归档（逐帧 × 转写对照）").setIcon("film").onClick(() => this.cmdDeepArchive()));
+    menu.addItem((i) => i.setTitle("晋升为来源笔记").setIcon("file-plus").onClick(() => this.cmdPromote()));
     menu.addItem((i) => i.setTitle("打开B站归档收件箱").setIcon("folder-open").onClick(() => this.cmdOpenInbox()));
     menu.addItem((i) => i.setTitle("同步B站收藏夹").setIcon("refresh-cw").onClick(() => this.cmdSyncFavorites()));
     menu.showAtMouseEvent(evt);
@@ -154,8 +241,7 @@ class BiliVaultLinkPlugin extends Plugin {
     const fs = window.require("fs");
     const bridgeJs = path.join(this.manifest.dir, "bili-bridge.js");
     if (!fs.existsSync(bridgeJs)) throw new Error(`桥接脚本不存在：${bridgeJs}`);
-    let nodeCfg = {};
-    try { nodeCfg = JSON.parse(await this.app.vault.adapter.read(normalizePath(".obsidian/plugins/douyin-sync/data.json"))).settings || {}; } catch {}
+    const nodeCfg = await this.readBridgeNodeConfig();
     const spawn = window.require("child_process").spawn;
     const node = (nodeCfg.bridgeNodePath || "").trim() || "node";
     const env = { ...process.env };
@@ -167,7 +253,35 @@ class BiliVaultLinkPlugin extends Plugin {
       await new Promise((r2) => setTimeout(r2, 500));
       try { const r = await requestUrl({ url: base + "/ping", throw: false }); if (r.status === 200) { new Notice("B站桥接已就绪"); return base; } } catch {}
     }
-    throw new Error("B站桥接启动超时（15s）。请确认 douyin-sync 桥接环境（node + playwright-core）可用。");
+    throw new Error("B站桥接启动超时（15s）。请确认桥接环境（node + playwright-core）可用。");
+  }
+
+  /* 桥接 node 环境配置：优先读 douyin-vault-link 自身设置，回落 douyin-sync（1.x 兼容） */
+  async readBridgeNodeConfig() {
+    for (const dir of ["douyin-vault-link", "douyin-sync"]) {
+      try {
+        const raw = await this.app.vault.adapter.read(normalizePath(`.obsidian/plugins/${dir}/data.json`));
+        const s = JSON.parse(raw).settings || {};
+        if (s.bridgeNodePath || s.bridgeNodeModules) return s;
+      } catch {}
+    }
+    return {};
+  }
+
+  /* ---- 同步日志 ---- */
+
+  async appendSyncLog(line) {
+    if (!this.settings.syncLogEnabled) return;
+    const p = normalizePath(this.settings.syncLogPath);
+    const header = "# B站同步归档日志\n\n> 过程产物（不入图谱）。伴生插件自动追加。\n";
+    const f = this.app.vault.getAbstractFileByPath(p);
+    if (f instanceof obsidian.TFile) {
+      const text = await this.app.vault.read(f);
+      await this.app.vault.modify(f, `${text.replace(/\n*$/, "\n")}${line}\n`);
+    } else {
+      await ensureFolder(this.app.vault, this.settings.syncLogPath.slice(0, this.settings.syncLogPath.lastIndexOf("/")));
+      await this.app.vault.create(p, `${header}\n${line}\n`);
+    }
   }
 
   /* 同步B站收藏夹：引擎元数据模式逐条入库 + AI 分类；新视频笔记可选自动深度归档 */
@@ -214,8 +328,10 @@ class BiliVaultLinkPlugin extends Plugin {
           }
         }
         new Notice(`同步完成：新增 ${after.length} 条` + (deep ? `，深度归档 ${deep} 条` : ""), 8000);
+        await this.appendSyncLog(`- ${nowStamp()} — 收藏夹同步：新增 ${after.length} 条${deep ? `，深度归档 ${deep} 条` : ""}${after.length ? `：${after.slice(0, 5).map((f) => f.basename).join("、")}${after.length > 5 ? " …" : ""}` : ""}`);
       } catch (e) {
         new Notice(`同步失败：${String(e.message || e).slice(0, 200)}`, 12000);
+        try { await this.appendSyncLog(`- ${nowStamp()} — 收藏夹同步失败：${String(e.message || e).slice(0, 120)}`); } catch {}
       }
     })();
   }
@@ -247,6 +363,7 @@ class BiliVaultLinkPlugin extends Plugin {
       }
       notice.hide();
       new Notice(`归档 ${created.length} 条` + (failed ? `，失败 ${failed}` : ""), 8000);
+      await this.appendSyncLog(`- ${nowStamp()} — 粘贴链接归档 ${created.length} 条${failed ? `，失败 ${failed}` : ""}${created.length ? `：${created.map((c) => c.bvid).join("、")}` : ""}`);
       if (this.settings.autoDeepArchive && created.length > 0) {
         let ok = 0;
         new Notice(`自动深度归档：${created.length} 条新笔记…`, 0);
@@ -281,10 +398,97 @@ class BiliVaultLinkPlugin extends Plugin {
         const notice = new Notice("深度归档：引擎启动…", 0);
         const out = await this.runEngineOnce({ bvid: fm.bvid, note: this.app.vault.adapter.getFullPath(f.path) }, (msg) => notice.setMessage(`深度归档：${msg}`));
         new Notice(`深度归档完成：${out ? `${out.frames} 帧 ｜ ${out.segments} 句` : "完成"}`, 8000);
+        await this.appendSyncLog(`- ${nowStamp()} — 深度归档「${f.basename}」：${out ? `${out.frames} 帧/${out.segments} 句` : "完成"}`);
       } catch (e) {
         new Notice(`深度归档失败：${String(e.message || e).slice(0, 200)}`, 10000);
       }
     })();
+  }
+
+  /* ---- 晋升为来源（与 douyin-vault-link 同构，douyin_id → bvid） ---- */
+
+  cmdPromote() {
+    const md = this.app.workspace.activeEditor;
+    if (!md || !md.file) { new Notice("请先打开B站归档里的视频笔记"); return; }
+    const f = md.file;
+    if (!f.path.startsWith(this.inboxDir() + "/")) { new Notice("当前笔记不在B站归档收件箱内"); return; }
+    void (async () => {
+      const text = await this.app.vault.read(f);
+      const { data } = parseFrontmatter(text);
+      if (!data.bvid) { new Notice("笔记缺少 bvid 属性，不是B站归档笔记"); return; }
+      if (data.vault_status === "已晋升") { new Notice(`该笔记已晋升：${data.promoted_to || ""}`); return; }
+      new PromoteModal(this.app, this, f, data).open();
+    })();
+  }
+
+  async promote(stagedFile, stagedData, plan) {
+    const name = sanitizeTitle(plan.title, 80) || `B站视频_${stagedData.bvid}`;
+    const targetPath = normalizePath(`${this.settings.sourceFolder}/${name}.md`);
+    if (this.app.vault.getAbstractFileByPath(targetPath)) { new Notice(`已存在 ${targetPath}，请换标题`); return false; }
+
+    const domainTags = plan.domains.map((d) => `  - domain/${d}`);
+    const content = [
+      "---",
+      "type: source",
+      "source-kind: 视频",
+      `author: ${fmStr(stagedData.author || "")}`,
+      `url: ${fmStr(stagedData.url || `https://www.bilibili.com/video/${stagedData.bvid}`)}`,
+      `created: ${fmStr(todayLocal())}`,
+      `bvid: ${fmStr(stagedData.bvid)}`,
+      stagedData.published ? `published: ${fmStr(stagedData.published)}` : null,
+      "tags:",
+      ...domainTags,
+      "---",
+      "",
+      `# ${name}`,
+      "",
+      "## 来源信息",
+      "",
+      `- 作者：${stagedData.author || "（缺失，不猜测）"}`,
+      `- 链接：${stagedData.url || `https://www.bilibili.com/video/${stagedData.bvid}`}（B站视频）`,
+      `- 收件箱：${mdLink(`${stagedFile.basename}`, stagedFile.path)}（逐字稿/图片文字全量在此；本页只留检索与结构）`,
+      "",
+      "## 为什么使用这个来源",
+      "",
+      plan.reason || "",
+      "",
+      "## 关键证据",
+      "",
+      "（待补：区分原文信息 / 自己的理解 / AI 辅助内容）",
+      "",
+      "## 关联问题与概念",
+      "",
+      "- [[ ]] —",
+      "",
+    ].filter((l) => l !== null).join("\n");
+
+    await ensureFolder(this.app.vault, this.settings.sourceFolder);
+    await this.app.vault.create(targetPath, content);
+
+    if (plan.mapPath) {
+      try {
+        const mf = this.app.vault.getAbstractFileByPath(normalizePath(plan.mapPath));
+        if (mf instanceof obsidian.TFile) {
+          const mapText = await this.app.vault.read(mf);
+          const linkLine = `- [[${name}]] — ${plan.reason || plan.group || "B站来源"}`;
+          const mapLines = mapText.split("\n");
+          const gIdx = mapLines.findIndex((l) => l.trim() === `### ${plan.group}`);
+          if (gIdx >= 0) mapLines.splice(gIdx + 1, 0, linkLine);
+          else mapLines.push("", `### ${plan.group}`, "", linkLine, "");
+          await this.app.vault.modify(mf, mapLines.join("\n"));
+        }
+      } catch (e) { new Notice(`挂地图失败：${String(e.message || e).slice(0, 100)}`); }
+    }
+
+    const stagedText = await this.app.vault.read(stagedFile);
+    await this.app.vault.process(stagedFile, () => updateFrontmatter(stagedText, {
+      vault_status: "已晋升",
+      promoted_to: `[[${name}]]`,
+    }));
+
+    await this.appendSyncLog(`- ${nowStamp()} — 晋升「${stagedFile.basename}」→ ${this.settings.sourceFolder}/${name}${plan.mapPath ? `（挂 ${plan.mapPath}）` : ""}`);
+    new Notice(`已晋升：${this.settings.sourceFolder}/${name}`);
+    return true;
   }
 
   /* 引擎单次执行：ref = {bvid|aid|url}，notePath 给定则更新该笔记 */
@@ -338,6 +542,76 @@ class BiliVaultLinkPlugin extends Plugin {
       });
     });
   }
+}
+
+/* ---------------- 晋升确认弹窗（与 douyin-vault-link 同构） ---------------- */
+
+class PromoteModal extends Modal {
+  constructor(app, plugin, stagedFile, stagedData) {
+    super(app);
+    this.plugin = plugin;
+    this.stagedFile = stagedFile;
+    this.stagedData = stagedData;
+    this.title = stagedData.title || stagedFile.basename.replace(/\s*\[[^\]]+\]$/, "");
+    this.domains = [];
+    this.mapPath = "";
+    this.group = "资料来源";
+    this.reason = "";
+  }
+
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.createEl("h3", { text: "晋升为来源笔记（写入 04-来源，需确认）" });
+    contentEl.createEl("p", { text: `收件箱：${this.stagedFile.path}` });
+
+    new Setting(contentEl).setName("来源标题（04-来源/标题.md）").addText((t) => {
+      t.setValue(this.title).onChange((v) => { this.title = v.trim(); });
+      t.inputEl.style.width = "100%";
+    });
+
+    const reg = this.plugin.settings.domainRegistry.split("\n").map((s) => s.trim()).filter(Boolean);
+    const domSetting = new Setting(contentEl).setName("领域标签（1~2 个，domain/<slug>）");
+    for (const slug of reg) {
+      domSetting.addToggle((tg) => {
+        tg.setValue(false).onChange((v) => {
+          if (v) {
+            if (this.domains.length >= 2) { tg.setValue(false); new Notice("最多 2 个标签"); return; }
+            this.domains.push(slug);
+          } else this.domains = this.domains.filter((d) => d !== slug);
+        });
+      });
+    }
+
+    const maps = this.app.vault.getMarkdownFiles()
+      .filter((f) => f.path.startsWith(this.plugin.settings.mapsFolder + "/"))
+      .sort((a, b) => a.basename.localeCompare(b.basename, "zh"));
+    new Setting(contentEl).setName("挂到主题地图（可选）").addDropdown((dd) => {
+      dd.addOption("", "不挂地图");
+      for (const f of maps) dd.addOption(f.path, f.basename);
+      dd.onChange((v) => { this.mapPath = v; });
+    });
+    new Setting(contentEl).setName("地图分组（### 标题，不存在则新建）").addText((t) => {
+      t.setValue(this.group).onChange((v) => { this.group = v.trim(); });
+    });
+    new Setting(contentEl).setName("归属理由（一句；同时写入「为什么使用这个来源」）").addText((t) => {
+      t.setValue("B站收藏的参考材料").onChange((v) => { this.reason = v.trim(); });
+      t.inputEl.style.width = "100%";
+    });
+
+    new Setting(contentEl)
+      .addButton((b) => b.setButtonText("取消").onClick(() => this.close()))
+      .addButton((b) => b.setCta().setButtonText("确认晋升").onClick(() => {
+        if (!this.title) { new Notice("标题不能为空"); return; }
+        if (this.domains.length < 1) { new Notice("至少 1 个 domain 标签"); return; }
+        this.close();
+        void this.plugin.promote(this.stagedFile, this.stagedData, {
+          title: this.title, domains: this.domains, mapPath: this.mapPath, group: this.group, reason: this.reason,
+        });
+      }));
+  }
+
+  onClose() { this.contentEl.empty(); }
 }
 
 module.exports = BiliVaultLinkPlugin;

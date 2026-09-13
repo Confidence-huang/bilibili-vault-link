@@ -76,9 +76,19 @@ def get_json(url: str):
 
 
 def load_categories() -> list[str]:
-    p = VAULT / ".obsidian" / "plugins" / "douyin-sync" / "data.json"
-    d = json.loads(p.read_text(encoding="utf-8"))
-    return [x.strip() for x in re.split(r"[\n,，;；]", d["settings"].get("aiCategories", "")) if x.strip()]
+    """分类列表：优先 douyin-vault-link（2.0.0 起自持设置），回落 douyin-sync（1.x 兼容）。"""
+    for plugin in ("douyin-vault-link", "douyin-sync"):
+        p = VAULT / ".obsidian" / "plugins" / plugin / "data.json"
+        if not p.exists():
+            continue
+        try:
+            d = json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        cats = [x.strip() for x in re.split(r"[\n,，;；]", (d.get("settings") or {}).get("aiCategories", "")) if x.strip()]
+        if cats:
+            return cats
+    return []
 
 
 def main() -> int:
