@@ -100,8 +100,20 @@ const server = http.createServer((req, res) => {
   send(res, 404, { error: "not found" });
 });
 
+/* 会话保活心跳：每 6 小时经页面内 fetch 打一次带登录态的轻量接口（nav），
+ * 让 B站看到活跃会话——Set-Cookie 续期直接落入持久化 profile（抖音桥接同款思路）。
+ * 启动时也打一次，顺带在控制台留登录态轨迹。 */
+const HEARTBEAT_MS = 6 * 60 * 60 * 1000;
+async function heartbeat() {
+  const s = await isLogin();
+  console.log(`[bili-bridge] heartbeat ${new Date().toISOString()} isLogin=${s.isLogin}${s.uname ? " (" + s.uname + ")" : ""}`);
+  if (!s.isLogin) console.log("[bili-bridge] 登录态失效！用 HEADED=1 启动本桥接扫码重登，或更新 %TEMP%\bili-cookies.txt");
+}
+setInterval(() => { heartbeat().catch(() => {}); }, HEARTBEAT_MS);
+
 (async () => {
   await launch();
+  heartbeat().catch(() => {});
   server.listen(PORT, "127.0.0.1", () => {
     console.log(`[bili-bridge] listening on http://127.0.0.1:${PORT} (headed=${HEADED})`);
     console.log(`[bili-bridge] profile: ${PROFILE}`);
