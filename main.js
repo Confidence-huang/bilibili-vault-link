@@ -12,7 +12,7 @@
 "use strict";
 
 const obsidian = require("obsidian");
-const { Plugin, Notice, normalizePath, Modal, PluginSettingTab, Setting, TFolder } = obsidian;
+const { Plugin, Notice, normalizePath, requestUrl, Modal, PluginSettingTab, Setting, TFolder } = obsidian;
 const path = require("path");
 
 const DEFAULT_SETTINGS = {
@@ -30,6 +30,7 @@ const DEFAULT_SETTINGS = {
   aiModel: "qwen2.5:3b",
   aiCategories: "成长学习\n投资理财\nAI编程\n心理情感\n职场商业\n娱乐生活\n运动健康\n其他（不好分类）",
   autoDeepArchive: false,
+  biliBridgeUrl: "http://127.0.0.1:8766",
 };
 
 const BILI_LINK_RE = /(?:https?:\/\/)?(?:www\.)?bilibili\.com\/video\/(BV[0-9A-Za-z]{8,12})|(?:https?:\/\/)?b23\.tv\/[A-Za-z0-9]+|\bav(\d{2,12})\b/gi;
@@ -98,6 +99,7 @@ class BiliVaultLinkSettingTab extends PluginSettingTab {
     });
     new Setting(containerEl).setName("ffmpeg 路径").addText((t) => t.setValue(s.ffmpegPath).onChange(async (v) => { s.ffmpegPath = v.trim(); await this.plugin.saveSettings(); }));
     new Setting(containerEl).setName("视频工作目录").setDesc("留空 = %TEMP%\\bilibili-vault-link\\<BV>").addText((t) => t.setValue(s.videoWorkRoot).onChange(async (v) => { s.videoWorkRoot = v.trim(); await this.plugin.saveSettings(); }));
+    new Setting(containerEl).setName("B站桥接地址").setDesc("同步收藏夹时自动拉起的活会话桥接（端口 8766；与抖音桥接 8765 并存）").addText((t) => t.setValue(s.biliBridgeUrl).onChange(async (v) => { s.biliBridgeUrl = v.trim() || "http://127.0.0.1:8766"; await this.plugin.saveSettings(); }));
     new Setting(containerEl).setName("B站 Cookies 文件").setDesc("会员/高清视频需要 yt-dlp cookies 文件路径；普通公开视频留空即可").addText((t) => t.setValue(s.cookiesFile || "").onChange(async (v) => { s.cookiesFile = v.trim(); await this.plugin.saveSettings(); }));
     new Setting(containerEl).setName("视觉图注（本地）").setHeading();
     new Setting(containerEl).setName("启用视觉图注").setDesc("逐帧交给本地多模态模型（如 Ollama qwen2.5vl），生成「字幕原文｜概述」图注").addToggle((t) => t.setValue(s.visionEnabled).onChange(async (v) => { s.visionEnabled = v; await this.plugin.saveSettings(); }));
@@ -120,6 +122,7 @@ class BiliVaultLinkPlugin extends Plugin {
     this.addCommand({ id: "paste-link-archive", name: "粘贴链接归档（BV/av/b23，单条/多条）", callback: () => this.cmdPasteArchive() });
     this.addCommand({ id: "deep-archive", name: "深度归档（逐帧提取 × 转写对照）", callback: () => this.cmdDeepArchive() });
     this.addCommand({ id: "open-inbox", name: "打开B站归档收件箱", callback: () => this.cmdOpenInbox() });
+    this.addCommand({ id: "sync-favorites", name: "同步B站收藏夹（元数据 + AI分类）", callback: () => this.cmdSyncFavorites() });
     this.addRibbonIcon("play-circle", "B站 × 笔记库桥接", (evt) => this.showMenu(evt));
   }
 
@@ -131,6 +134,7 @@ class BiliVaultLinkPlugin extends Plugin {
     menu.addItem((i) => i.setTitle("粘贴链接归档").setIcon("clipboard").onClick(() => this.cmdPasteArchive()));
     menu.addItem((i) => i.setTitle("深度归档（逐帧 × 转写对照）").setIcon("film").onClick(() => this.cmdDeepArchive()));
     menu.addItem((i) => i.setTitle("打开B站归档收件箱").setIcon("folder-open").onClick(() => this.cmdOpenInbox()));
+    menu.addItem((i) => i.setTitle("同步B站收藏夹").setIcon("refresh-cw").onClick(() => this.cmdSyncFavorites()));
     menu.showAtMouseEvent(evt);
   }
 
@@ -140,6 +144,80 @@ class BiliVaultLinkPlugin extends Plugin {
     const os = window.require("os");
     const py = (this.settings.enginePython || "").trim() || path.join(os.homedir(), ".agents", "skills", "bilibili-video-learning", ".venv-gpu", "Scripts", "python.exe");
     return { py, script: path.resolve(path.dirname(py), "..", "..", "scripts", "bilibili_deep_archive.py") };
+  }
+
+  /* B站桥接（活会话，8766）：同步收藏夹时自动拉起 */
+  async ensureBiliBridge() {
+    const base = this.settings.biliBridgeUrl || "http://127.0.0.1:8766";
+    try { const r = await requestUrl({ url: base + "/ping", throw: false }); if (r.status === 200) return base; } catch {}
+    new Notice("B站桥接未运行，正在拉起…");
+    const fs = window.require("fs");
+    const bridgeJs = path.join(this.manifest.dir, "bili-bridge.js");
+    if (!fs.existsSync(bridgeJs)) throw new Error(`桥接脚本不存在：${bridgeJs}`);
+    let nodeCfg = {};
+    try { nodeCfg = JSON.parse(await this.app.vault.adapter.read(normalizePath(".obsidian/plugins/douyin-sync/data.json"))).settings || {}; } catch {}
+    const spawn = window.require("child_process").spawn;
+    const node = (nodeCfg.bridgeNodePath || "").trim() || "node";
+    const env = { ...process.env };
+    const nm = (nodeCfg.bridgeNodeModules || "").trim();
+    if (nm) { env.NODE_PATH = nm; env.DOUYIN_SYNC_INSTALLER = nm.replace(/[\\/]node_modules$/, ""); }
+    const child = spawn(node, [bridgeJs, String(Number(base.split(":").pop()) || 8766)], { detached: true, stdio: "ignore", windowsHide: true, env, cwd: this.manifest.dir });
+    child.unref?.();
+    for (let i = 0; i < 30; i++) {
+      await new Promise((r2) => setTimeout(r2, 500));
+      try { const r = await requestUrl({ url: base + "/ping", throw: false }); if (r.status === 200) { new Notice("B站桥接已就绪"); return base; } } catch {}
+    }
+    throw new Error("B站桥接启动超时（15s）。请确认 douyin-sync 桥接环境（node + playwright-core）可用。");
+  }
+
+  /* 同步B站收藏夹：引擎元数据模式逐条入库 + AI 分类；新视频笔记可选自动深度归档 */
+  cmdSyncFavorites() {
+    void (async () => {
+      try {
+        const { py } = this.enginePaths();
+        const fs = window.require("fs");
+        const syncScript = path.join(this.manifest.dir, "tools", "bili-fav-sync.py");
+        if (!fs.existsSync(syncScript)) throw new Error(`同步脚本不存在：${syncScript}（请随插件分发 tools/bili-fav-sync.py）`);
+        const vaultRoot = this.app.vault.adapter.getBasePath();
+        const inboxPrefix = this.inboxDir() + "/";
+        const before = new Set(this.app.vault.getMarkdownFiles().filter((f) => f.path.startsWith(inboxPrefix)).map((f) => f.path));
+        const bridge = await this.ensureBiliBridge();
+        const notice = new Notice("同步B站收藏夹…", 0);
+        await new Promise((resolve, reject) => {
+          const env = { ...process.env };
+          env.PYTHONIOENCODING = "utf-8";
+          env.BILI_VIDEO_BRIDGE = bridge;
+          delete env.BILIBILI_OBSIDIAN_VAULT;
+          const cp = spawn(py, [syncScript, "--vault", vaultRoot], { windowsHide: true, env });
+          let stderr = "";
+          const timer = setTimeout(() => { cp.kill(); reject(new Error("同步超时（40 分钟）")); }, 40 * 60 * 1000);
+          cp.stderr.on("data", (d) => {
+            stderr += d;
+            const lines = String(d).match(/\[[夹\d][^\r\n]*\]/g);
+            if (lines) notice.setMessage(`同步B站收藏夹：${lines[lines.length - 1].replace(/^\[/, "").replace(/\]$/, "").slice(0, 60)}`);
+          });
+          cp.on("error", (e) => { clearTimeout(timer); reject(e); });
+          cp.on("close", (code) => { clearTimeout(timer); code === 0 ? resolve() : reject(new Error(stderr.trim().split("\n").pop()?.slice(0, 200) || `退出码 ${code}`)); });
+        });
+        const after = this.app.vault.getMarkdownFiles().filter((f) => f.path.startsWith(inboxPrefix) && !before.has(f.path));
+        let deep = 0;
+        if (this.settings.autoDeepArchive && after.length > 0) {
+          new Notice(`自动深度归档：${after.length} 条新增…`, 0);
+          for (const nf of after) {
+            try {
+              const text = await this.app.vault.read(nf);
+              const fm = (() => { const o = {}; const m = text.match(/^---\n([\s\S]*?)\n---/); if (m) for (const line of m[1].split("\n")) { const mm = line.match(/^([A-Za-z_]\w*):\s*(.*)$/); if (mm) o[mm[1]] = mm[2].replace(/^"|"$/g, ""); } return o; })();
+              if (!fm.bvid || (fm.type && fm.type !== "视频")) continue;
+              await this.runEngineOnce({ bvid: fm.bvid, note: path.join(vaultRoot, nf.path) }, () => {});
+              deep++;
+            } catch (e) { new Notice(`深度归档失败（${nf.basename.slice(0, 24)}）：${String(e.message || e).slice(0, 80)}`, 8000); }
+          }
+        }
+        new Notice(`同步完成：新增 ${after.length} 条` + (deep ? `，深度归档 ${deep} 条` : ""), 8000);
+      } catch (e) {
+        new Notice(`同步失败：${String(e.message || e).slice(0, 200)}`, 12000);
+      }
+    })();
   }
 
   cmdOpenInbox() {

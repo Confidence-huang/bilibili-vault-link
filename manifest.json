@@ -1,9 +1,9 @@
 {
   "id": "bilibili-vault-link",
-  "name": "bilibili-vault-link",
-  "version": "1.0.1",
+  "name": "B站 × 笔记库桥接",
+  "version": "1.1.0",
   "minAppVersion": "1.9.0",
-  "description": "Learning Vault 式库：B站视频粘贴链接归档 + 深度归档（本地 GPU 转写、逐帧图注、AI 自动分类），引擎=bilibili-video-learning 技能",
+  "description": "Learning Vault 式库：B站收藏夹同步（元数据+AI分类）、粘贴链接归档、深度归档（本地 GPU 转写、逐帧图注），引擎=bilibili-video-learning 技能",
   "author": "Confidence-huang",
   "isDesktopOnly": true
 }
